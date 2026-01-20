@@ -1,0 +1,240 @@
+import asyncio
+from typing import Optional, Dict, Any, List
+from pydantic import BaseModel, Field
+from modules.prompting.templating import render_prompt
+from modules.models import get_model
+from modules.settings import get_settings
+
+class VisionTextFilter:
+    """
+    Hybrid filter that routes queries based on content type.
+    Text-only queries → gpt-oss
+    Queries with images → gemma (for vision) → gpt-oss (for final response)
+    """
+    
+    class Valves(BaseModel):
+        vision_model_name: str = Field(
+            default="gemma",
+            description="Name of the vision model to use for image analysis"
+        )
+        text_model_name: str = Field(
+            default="gpt-oss",
+            description="Name of the text model to use for final response"
+        )
+        max_image_analysis_tokens: int = Field(
+            default=500,
+            description="Maximum tokens for image description"
+        )
+        system_prompt_for_vision: str = Field(
+            default="You are an image analysis assistant. Describe the image in detail, focusing on key elements, text, people, objects, and context. Be concise but thorough.",
+            description="System prompt for vision analysis"
+        )
+        system_prompt_for_final: str = Field(
+            default="You are a helpful assistant. Use the provided image description to answer the user's query.",
+            description="System prompt for final response"
+        )
+    
+    def __init__(self):
+        self.valves = self.Valves()
+    
+    async def inlet(self, body: Dict[str, Any], __user__: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Main filter function that processes incoming requests
+        """
+        try:
+            # Check if request contains images
+            has_images = self._check_for_images(body)
+            
+            if has_images:
+                # Process with vision-text pipeline
+                return await self._process_vision_query(body, __user__)
+            else:
+                # Process with text-only pipeline
+                return await self._process_text_query(body)
+                
+        except Exception as e:
+            print(f"Error in VisionTextFilter: {str(e)}")
+            # Fall back to default behavior
+            return body
+    
+    def _check_for_images(self, body: Dict[str, Any]) -> bool:
+        """Check if the request contains any images"""
+        messages = body.get("messages", [])
+        
+        for message in messages:
+            content = message.get("content", "")
+            # Check for image data in content
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "image_url":
+                        return True
+                    elif isinstance(item, dict) and item.get("type") == "image":
+                        return True
+            # Check for image files
+            if message.get("files"):
+                for file in message.get("files", []):
+                    if file.get("type", "").startswith("image/"):
+                        return True
+        
+        return False
+    
+    async def _process_vision_query(self, body: Dict[str, Any], __user__: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Process queries with images: gemma → gpt-oss pipeline
+        """
+        # Step 1: Extract user query and images
+        user_query, images_data = self._extract_query_and_images(body)
+        
+        # Step 2: Analyze images with gemma
+        image_descriptions = []
+        for image_data in images_data:
+            description = await self._analyze_image_with_gemma(image_data, user_query, __user__)
+            image_descriptions.append(description)
+        
+        # Combine all image descriptions
+        combined_description = "\n\n".join(image_descriptions)
+        
+        # Step 3: Prepare final query for gpt-oss
+        final_messages = [
+            {
+                "role": "system",
+                "content": f"{self.valves.system_prompt_for_final}\n\nImage Descriptions:\n{combined_description}"
+            },
+            {
+                "role": "user",
+                "content": user_query
+            }
+        ]
+        
+        # Step 4: Create final request for gpt-oss
+        final_body = body.copy()
+        final_body["model"] = self.valves.text_model_name
+        final_body["messages"] = final_messages
+        
+        # Remove image data from final request
+        self._clean_messages_of_images(final_body)
+        
+        return final_body
+    
+    def _extract_query_and_images(self, body: Dict[str, Any]) -> tuple:
+        """Extract text query and image data from messages"""
+        messages = body.get("messages", [])
+        last_user_message = None
+        images_data = []
+        
+        for message in messages:
+            if message.get("role") == "user":
+                content = message.get("content", "")
+                last_user_message = ""
+                
+                if isinstance(content, str):
+                    last_user_message = content
+                elif isinstance(content, list):
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            if item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                            elif item.get("type") in ["image_url", "image"]:
+                                images_data.append(item)
+                        elif isinstance(item, str):
+                            text_parts.append(item)
+                    last_user_message = " ".join(text_parts)
+        
+        # Also check for files
+        for message in messages:
+            if message.get("files"):
+                for file in message.get("files", []):
+                    if file.get("type", "").startswith("image/"):
+                        images_data.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"file://{file.get('path', '')}"}
+                        })
+        
+        return last_user_message or "", images_data
+    
+    async def _analyze_image_with_gemma(self, image_data: Dict, user_query: str, __user__: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Analyze a single image using gemma vision model
+        """
+        try:
+            # Prepare vision analysis request
+            vision_messages = [
+                {
+                    "role": "system",
+                    "content": self.valves.system_prompt_for_vision
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Describe this image in detail. User query context: {user_query}"
+                        },
+                        image_data
+                    ]
+                }
+            ]
+            
+            # Create vision request body
+            vision_body = {
+                "model": self.valves.vision_model_name,
+                "messages": vision_messages,
+                "max_tokens": self.valves.max_image_analysis_tokens,
+                "temperature": 0.1,
+                "stream": False
+            }
+            
+            # Simulate the vision model call
+            # Note: In OpenWebUI, you might need to use internal APIs
+            # This is a placeholder - adjust based on your OpenWebUI version
+            
+            # For OpenWebUI v0.2.x+, you can use:
+            from modules import ollama
+            
+            response = await ollama.generate(
+                model_name=self.valves.vision_model_name,
+                messages=vision_messages,
+                stream=False,
+                max_tokens=self.valves.max_image_analysis_tokens,
+                temperature=0.1
+            )
+            
+            if response and "message" in response:
+                return response["message"].get("content", "No description generated.")
+            
+            return "Failed to generate image description."
+            
+        except Exception as e:
+            print(f"Error analyzing image with gemma: {str(e)}")
+            return f"Image analysis error: {str(e)}"
+    
+    def _clean_messages_of_images(self, body: Dict[str, Any]):
+        """Remove image content from messages"""
+        messages = body.get("messages", [])
+        
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, list):
+                # Keep only text items
+                text_items = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_items.append(item)
+                    elif isinstance(item, str):
+                        text_items.append({"type": "text", "text": item})
+                
+                if text_items:
+                    message["content"] = text_items
+                elif len(text_items) == 1:
+                    message["content"] = text_items[0]["text"]
+                else:
+                    message["content"] = ""
+    
+    async def _process_text_query(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Process text-only queries directly with gpt-oss
+        """
+        body["model"] = self.valves.text_model_name
+        self._clean_messages_of_images(body)
+        return body

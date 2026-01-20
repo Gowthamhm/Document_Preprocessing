@@ -1,0 +1,49 @@
+import asyncio
+from typing import Optional, Dict, Any
+
+class SimpleVisionTextFilter:
+    """
+    Simple hybrid filter for vision and text queries
+    """
+    
+    class Valves:
+        def __init__(self):
+            self.vision_model = "gemma"
+            self.text_model = "gpt-oss"
+    
+    def __init__(self):
+        self.valves = self.Valves()
+    
+    async def inlet(self, body: Dict[str, Any], __user__: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        # Check for images in the request
+        has_images = False
+        messages = body.get("messages", [])
+        
+        for message in messages:
+            content = message.get("content", "")
+            files = message.get("files", [])
+            
+            # Check for image URLs or base64 images
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") in ["image_url", "image"]:
+                            has_images = True
+                            break
+            
+            # Check for uploaded files
+            for file in files:
+                if isinstance(file, dict) and file.get("type", "").startswith("image/"):
+                    has_images = True
+                    break
+            
+            if has_images:
+                break
+        
+        # Route to appropriate model
+        if has_images:
+            body["model"] = self.valves.vision_model
+        else:
+            body["model"] = self.valves.text_model
+        
+        return body
