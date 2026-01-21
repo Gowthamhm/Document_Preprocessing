@@ -1,0 +1,316 @@
+import asyncio
+import json
+import base64
+from typing import Optional, Dict, Any, List
+from pydantic import BaseModel, Field
+from modules import shared
+
+class VisionTextRouter:
+    """
+    Hybrid router for OpenWebUI 0.6.36
+    Routes queries with images to gemma, text-only to gpt-oss
+    Uses sequential pipeline for vision queries: gemma → gpt-oss
+    """
+    
+    class Valves(BaseModel):
+        vision_model: str = Field(
+            default="gemma",
+            description="Vision model for image analysis"
+        )
+        text_model: str = Field(
+            default="gpt-oss", 
+            description="Text model for final responses"
+        )
+        max_vision_tokens: int = Field(
+            default=300,
+            description="Max tokens for vision analysis"
+        )
+        vision_temperature: float = Field(
+            default=0.1,
+            description="Temperature for vision analysis"
+        )
+        enable_sequential_pipeline: bool = Field(
+            default=True,
+            description="Enable gemma→gpt-oss pipeline for vision queries"
+        )
+        vision_system_prompt: str = Field(
+            default="Analyze this image and provide a detailed description including objects, text, people, colors, context, and any notable details. Be factual and thorough.",
+            description="System prompt for vision analysis"
+        )
+        final_system_prompt: str = Field(
+            default="You are a helpful assistant. Use the image description to answer the user's query. If the image description doesn't contain relevant information, respond based on your general knowledge.",
+            description="System prompt for final response"
+        )
+    
+    def __init__(self):
+        self.valves = self.Valves()
+        self.ollama_api_url = "http://localhost:11434/api/generate"
+    
+    async def inlet(self, message: Dict[str, Any], model: str, 
+                   messages: List[Dict[str, Any]], body: Dict[str, Any], 
+                   __user__: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Main entry point for the filter
+        """
+        try:
+            # Check if the current message contains images
+            has_images = await self._has_images(message, messages)
+            
+            if has_images and self.valves.enable_sequential_pipeline:
+                # Process with vision pipeline
+                return await self._process_vision_pipeline(message, messages, body, __user__)
+            elif has_images:
+                # Direct to vision model
+                body["model"] = self.valves.vision_model
+                return body
+            else:
+                # Text-only to text model
+                body["model"] = self.valves.text_model
+                return body
+                
+        except Exception as e:
+            print(f"[VisionTextRouter] Error: {e}")
+            # Fallback: use text model
+            body["model"] = self.valves.text_model
+            return body
+    
+    async def _has_images(self, message: Dict[str, Any], messages: List[Dict[str, Any]]) -> bool:
+        """Check if any message contains images"""
+        # Check current message
+        if self._message_has_images(message):
+            return True
+        
+        # Check all messages in conversation
+        for msg in messages:
+            if self._message_has_images(msg):
+                return True
+        
+        return False
+    
+    def _message_has_images(self, message: Dict[str, Any]) -> bool:
+        """Check if a single message contains images"""
+        content = message.get("content", "")
+        
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    # Check for image_url format
+                    if item.get("type") == "image_url":
+                        return True
+                    # Check for OpenWebUI 0.6.x format
+                    elif item.get("type") == "image":
+                        return True
+                    elif item.get("type") == "file" and "image" in item.get("mime_type", ""):
+                        return True
+        
+        # Check for files in message
+        if "files" in message and message["files"]:
+            for file in message["files"]:
+                if isinstance(file, dict):
+                    if file.get("type", "").startswith("image/"):
+                        return True
+                    if file.get("content_type", "").startswith("image/"):
+                        return True
+        
+        return False
+    
+    async def _process_vision_pipeline(self, message: Dict[str, Any], 
+                                      messages: List[Dict[str, Any]], 
+                                      body: Dict[str, Any], 
+                                      __user__: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Process vision queries through gemma → gpt-oss pipeline
+        """
+        try:
+            # Step 1: Extract images and text query
+            images_data, text_query = await self._extract_vision_data(message, messages)
+            
+            if not images_data:
+                # No images found, fallback to text model
+                body["model"] = self.valves.text_model
+                return body
+            
+            # Step 2: Analyze images with gemma
+            image_descriptions = []
+            for idx, image_data in enumerate(images_data):
+                description = await self._analyze_image_with_gemma(image_data, text_query, idx)
+                if description:
+                    image_descriptions.append(description)
+            
+            if not image_descriptions:
+                # Failed to analyze images
+                body["model"] = self.valves.text_model
+                return body
+            
+            # Step 3: Prepare enhanced context for gpt-oss
+            combined_description = "\n\n".join([f"Image {i+1}: {desc}" for i, desc in enumerate(image_descriptions)])
+            
+            # Create system message with image descriptions
+            system_message = {
+                "role": "system",
+                "content": f"{self.valves.final_system_prompt}\n\n### Image Analysis Results:\n{combined_description}"
+            }
+            
+            # Create user message with original query
+            user_message = {
+                "role": "user",
+                "content": text_query if text_query else "Please analyze the images and respond accordingly."
+            }
+            
+            # Prepare final messages
+            final_messages = [system_message, user_message]
+            
+            # Keep conversation history if needed
+            if len(messages) > 1:
+                # Add previous messages (excluding the last one which contains images)
+                history_messages = []
+                for msg in messages[:-1]:
+                    if msg.get("role") in ["user", "assistant"]:
+                        history_messages.append({
+                            "role": msg["role"],
+                            "content": self._extract_text_content(msg)
+                        })
+                
+                final_messages = history_messages + [system_message, user_message]
+            
+            # Update the body for gpt-oss
+            body["model"] = self.valves.text_model
+            body["messages"] = final_messages
+            
+            # Clean up any image data
+            body = self._clean_image_data(body)
+            
+            return body
+            
+        except Exception as e:
+            print(f"[VisionTextRouter] Pipeline error: {e}")
+            # Fallback to vision model directly
+            body["model"] = self.valves.vision_model
+            return body
+    
+    async def _extract_vision_data(self, message: Dict[str, Any], 
+                                  messages: List[Dict[str, Any]]) -> tuple:
+        """Extract image data and text query from messages"""
+        images_data = []
+        text_query = ""
+        
+        # Process current message
+        current_content = message.get("content", "")
+        if isinstance(current_content, list):
+            text_parts = []
+            for item in current_content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif item.get("type") in ["image_url", "image"]:
+                        images_data.append(item)
+                elif isinstance(item, str):
+                    text_parts.append(item)
+            text_query = " ".join(text_parts)
+        elif isinstance(current_content, str):
+            text_query = current_content
+        
+        # Extract additional text from previous messages if needed
+        if not text_query and len(messages) > 1:
+            for msg in messages[::-1]:  # Start from most recent
+                if msg.get("role") == "user":
+                    content = self._extract_text_content(msg)
+                    if content:
+                        text_query = content
+                        break
+        
+        return images_data, text_query
+    
+    async def _analyze_image_with_gemma(self, image_data: Dict, 
+                                       context: str, image_idx: int) -> Optional[str]:
+        """
+        Analyze image using gemma vision model via Ollama API
+        """
+        try:
+            # Prepare the vision prompt
+            vision_prompt = f"Analyze this image"
+            if context:
+                vision_prompt += f" in the context of: {context}"
+            vision_prompt += ". Describe what you see in detail."
+            
+            # Prepare messages for vision model
+            vision_messages = [
+                {
+                    "role": "system",
+                    "content": self.valves.vision_system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": vision_prompt},
+                        image_data
+                    ]
+                }
+            ]
+            
+            # Call Ollama API directly
+            import aiohttp
+            
+            ollama_payload = {
+                "model": self.valves.vision_model,
+                "messages": vision_messages,
+                "stream": False,
+                "options": {
+                    "temperature": self.valves.vision_temperature,
+                    "num_predict": self.valves.max_vision_tokens
+                }
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.ollama_api_url, json=ollama_payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result.get("message", {}).get("content", "")
+                    else:
+                        print(f"[VisionTextRouter] Vision API error: {response.status}")
+                        return None
+                        
+        except Exception as e:
+            print(f"[VisionTextRouter] Image analysis error: {e}")
+            return None
+    
+    def _extract_text_content(self, message: Dict[str, Any]) -> str:
+        """Extract text content from a message"""
+        content = message.get("content", "")
+        
+        if isinstance(content, str):
+            return content
+        elif isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    text_parts.append(item)
+            return " ".join(text_parts)
+        
+        return ""
+    
+    def _clean_image_data(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove image data from messages"""
+        if "messages" in body:
+            for msg in body["messages"]:
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    # Filter out image items
+                    text_items = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text_items.append(item)
+                        elif isinstance(item, str):
+                            text_items.append({"type": "text", "text": item})
+                    
+                    if text_items:
+                        if len(text_items) == 1:
+                            msg["content"] = text_items[0]["text"]
+                        else:
+                            msg["content"] = text_items
+                    else:
+                        msg["content"] = ""
+        
+        return body

@@ -1,0 +1,61 @@
+import asyncio
+from typing import Optional, Dict, Any, List
+from pydantic import BaseModel, Field
+
+class SimpleVisionRouter:
+    """
+    Simple router for OpenWebUI 0.6.36
+    Directly routes to gemma for images, gpt-oss for text
+    """
+    
+    class Valves(BaseModel):
+        vision_model: str = Field(default="gemma")
+        text_model: str = Field(default="gpt-oss")
+    
+    def __init__(self):
+        self.valves = self.Valves()
+    
+    async def inlet(self, message: Dict[str, Any], model: str, 
+                   messages: List[Dict[str, Any]], body: Dict[str, Any], 
+                   __user__: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Route based on content type
+        """
+        # Check all messages for images
+        has_images = False
+        
+        # Check current message first
+        content = message.get("content", "")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") in ["image_url", "image"]:
+                    has_images = True
+                    break
+        
+        # Check message files
+        if not has_images and message.get("files"):
+            for file in message["files"]:
+                if isinstance(file, dict):
+                    if file.get("type", "").startswith("image/") or file.get("content_type", "").startswith("image/"):
+                        has_images = True
+                        break
+        
+        # Check conversation history
+        if not has_images:
+            for msg in messages:
+                msg_content = msg.get("content", "")
+                if isinstance(msg_content, list):
+                    for item in msg_content:
+                        if isinstance(item, dict) and item.get("type") in ["image_url", "image"]:
+                            has_images = True
+                            break
+                if has_images:
+                    break
+        
+        # Route to appropriate model
+        if has_images:
+            body["model"] = self.valves.vision_model
+        else:
+            body["model"] = self.valves.text_model
+        
+        return body
