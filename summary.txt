@@ -1,0 +1,372 @@
+import csv
+import re
+from collections import defaultdict
+import os
+import sys
+
+def clean_value(value):
+    """Clean and normalize a value"""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+def extract_cve_ids(text):
+    """Extract CVE IDs from text using regex"""
+    if not text:
+        return []
+    # CVE pattern: CVE-YYYY-NNNN+
+    cve_pattern = r'CVE-\d{4}-\d+'
+    matches = re.findall(cve_pattern, text, re.IGNORECASE)
+    # Remove duplicates while preserving case (convert to upper for consistency)
+    unique_matches = []
+    seen = set()
+    for match in matches:
+        upper_match = match.upper()
+        if upper_match not in seen:
+            seen.add(upper_match)
+            unique_matches.append(upper_match)
+    return unique_matches
+
+def is_valid_ip(ip_str):
+    """Check if string is a valid IPv4 address"""
+    if not ip_str:
+        return False
+    parts = ip_str.split('.')
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(part) <= 255 for part in parts)
+    except ValueError:
+        return False
+
+def format_ip_addresses(ip_list):
+    """Format IP addresses: first IP full, others last 2 octets"""
+    if not ip_list:
+        return ""
+    
+    # Remove duplicates and sort
+    unique_ips = sorted(set(ip for ip in ip_list if ip.strip()))
+    if not unique_ips:
+        return ""
+    
+    formatted = []
+    # First IP - full format
+    formatted.append(unique_ips[0])
+    
+    # Remaining IPs - last 2 octets only
+    for ip in unique_ips[1:]:
+        if is_valid_ip(ip):
+            parts = ip.split('.')
+            formatted.append(f"{parts[2]}.{parts[3]}")
+        else:
+            # If not valid IPv4, keep as is
+            formatted.append(ip)
+    
+    return ", ".join(formatted)
+
+def detect_delimiter(file_path):
+    """Try to detect CSV delimiter"""
+    delimiters = [',', ';', '\t', '|']
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        first_line = f.readline()
+    
+    # Count occurrences of each delimiter
+    counts = {delim: first_line.count(delim) for delim in delimiters}
+    
+    # Return delimiter with highest count (if any)
+    best_delim = max(counts.items(), key=lambda x: x[1])
+    if best_delim[1] > 0:
+        return best_delim[0]
+    return ','  # Default to comma
+
+def read_csv_file(file_path):
+    """Read CSV file and return data as list of dictionaries"""
+    delimiter = detect_delimiter(file_path)
+    data = []
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            # Try UTF-8 first
+            reader = csv.reader(f, delimiter=delimiter)
+            headers = next(reader)
+            print(f"Found columns: {headers}")
+            
+            for row in reader:
+                if len(row) != len(headers):
+                    # Skip malformed rows or pad with empty strings
+                    if len(row) > len(headers):
+                        row = row[:len(headers)]
+                    else:
+                        row = row + [''] * (len(headers) - len(row))
+                
+                row_dict = {headers[i]: clean_value(row[i]) for i in range(len(headers))}
+                data.append(row_dict)
+                
+    except UnicodeDecodeError:
+        # Try with latin-1 encoding
+        with open(file_path, 'r', encoding='latin-1') as f:
+            reader = csv.reader(f, delimiter=delimiter)
+            headers = next(reader)
+            print(f"Found columns (latin-1): {headers}")
+            
+            for row in reader:
+                if len(row) != len(headers):
+                    if len(row) > len(headers):
+                        row = row[:len(headers)]
+                    else:
+                        row = row + [''] * (len(headers) - len(row))
+                
+                row_dict = {headers[i]: clean_value(row[i]) for i in range(len(headers))}
+                data.append(row_dict)
+    
+    return data, headers
+
+def map_columns(headers):
+    """Map detected columns to standard names"""
+    # Standard column names we're looking for
+    standard_names = ['nvt', 'impact', 'solution', 'cve', 'ip']
+    
+    # Keywords for each column type
+    keywords = {
+        'nvt': ['nvt', 'vulnerability', 'plugin', 'vuln', 'name', 'description', 'title'],
+        'impact': ['impact', 'severity', 'risk', 'level', 'criticality'],
+        'solution': ['solution', 'remediation', 'fix', 'recommendation', 'action'],
+        'cve': ['cve', 'reference', 'id', 'cve-id', 'cve_id'],
+        'ip': ['ip', 'host', 'target', 'address', 'hostip', 'host_ip']
+    }
+    
+    mapping = {}
+    used_headers = set()
+    
+    # First pass: try exact matches (case-insensitive)
+    for std_name in standard_names:
+        for header in headers:
+            header_lower = header.lower()
+            if std_name in header_lower and header not in used_headers:
+                mapping[std_name] = header
+                used_headers.add(header)
+                break
+    
+    # Second pass: try keyword matching
+    for std_name in standard_names:
+        if std_name not in mapping:
+            for header in headers:
+                if header in used_headers:
+                    continue
+                header_lower = header.lower()
+                for keyword in keywords[std_name]:
+                    if keyword in header_lower:
+                        mapping[std_name] = header
+                        used_headers.add(header)
+                        break
+                if std_name in mapping:
+                    break
+    
+    # Third pass: assign first unused columns in order
+    column_order = ['nvt', 'impact', 'solution', 'cve', 'ip']
+    for std_name in column_order:
+        if std_name not in mapping:
+            for header in headers:
+                if header not in used_headers:
+                    mapping[std_name] = header
+                    used_headers.add(header)
+                    break
+    
+    return mapping
+
+def summarize_vapt_data(input_file, output_file):
+    """Main function to summarize VAPT data"""
+    print(f"Processing: {input_file}")
+    
+    # Read CSV data
+    data, headers = read_csv_file(input_file)
+    
+    if not data:
+        print("No data found in the file!")
+        return
+    
+    print(f"Total rows: {len(data)}")
+    
+    # Map columns
+    column_map = map_columns(headers)
+    print(f"\nColumn mapping:")
+    for std_name, orig_name in column_map.items():
+        print(f"  {std_name.upper():10} -> {orig_name}")
+    
+    # Create summary dictionary
+    summary = defaultdict(lambda: {
+        'impacts': set(),
+        'solutions': set(),
+        'cves': set(),
+        'ips': set()
+    })
+    
+    # Process each row
+    for row in data:
+        # Get values using column mapping
+        nvt_name = row.get(column_map.get('nvt', ''), '')
+        impact = row.get(column_map.get('impact', ''), '')
+        solution = row.get(column_map.get('solution', ''), '')
+        cve = row.get(column_map.get('cve', ''), '')
+        ip = row.get(column_map.get('ip', ''), '')
+        
+        # Clean and process
+        nvt_name = clean_value(nvt_name)
+        if not nvt_name:
+            continue
+        
+        # Add impact
+        impact_clean = clean_value(impact)
+        if impact_clean:
+            summary[nvt_name]['impacts'].add(impact_clean)
+        
+        # Add solution
+        solution_clean = clean_value(solution)
+        if solution_clean:
+            summary[nvt_name]['solutions'].add(solution_clean)
+        
+        # Add CVEs
+        cve_clean = clean_value(cve)
+        if cve_clean:
+            # Extract CVE IDs
+            extracted_cves = extract_cve_ids(cve_clean)
+            if extracted_cves:
+                for cve_id in extracted_cves:
+                    summary[nvt_name]['cves'].add(cve_id)
+            else:
+                # Add as-is if no CVE pattern found
+                summary[nvt_name]['cves'].add(cve_clean)
+        
+        # Add IPs (handle multiple IPs separated by commas/semicolons)
+        ip_clean = clean_value(ip)
+        if ip_clean:
+            # Split by common separators
+            ip_parts = re.split(r'[,;|]', ip_clean)
+            for ip_part in ip_parts:
+                ip_part_clean = clean_value(ip_part)
+                if ip_part_clean:
+                    summary[nvt_name]['ips'].add(ip_part_clean)
+    
+    # Prepare output data
+    output_data = []
+    for nvt_name in sorted(summary.keys()):
+        data = summary[nvt_name]
+        
+        # Format impacts
+        impacts_formatted = "; ".join(sorted(data['impacts'])) if data['impacts'] else "Not specified"
+        
+        # Format solutions
+        solutions_formatted = "; ".join(sorted(data['solutions'])) if data['solutions'] else "Not available"
+        
+        # Format CVEs
+        cves_formatted = "; ".join(sorted(data['cves'])) if data['cves'] else "No CVE"
+        
+        # Format IPs
+        ips_formatted = format_ip_addresses(sorted(data['ips'])) if data['ips'] else "No IPs"
+        
+        output_data.append({
+            'NVT Name': nvt_name,
+            'All Impacts': impacts_formatted,
+            'All Solutions': solutions_formatted,
+            'All CVEs': cves_formatted,
+            'Unique IPs': ips_formatted
+        })
+    
+    # Write output CSV
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        fieldnames = ['NVT Name', 'All Impacts', 'All Solutions', 'All CVEs', 'Unique IPs']
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        
+        writer.writeheader()
+        writer.writerows(output_data)
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print("SUMMARY COMPLETE")
+    print(f"{'='*60}")
+    print(f"Input records processed: {len(data)}")
+    print(f"Unique NVT names found: {len(output_data)}")
+    print(f"Output saved to: {output_file}")
+    
+    # Show statistics
+    print(f"\nStatistics:")
+    multi_impacts = sum(1 for row in output_data if ';' in row['All Impacts'] and row['All Impacts'] != 'Not specified')
+    multi_solutions = sum(1 for row in output_data if ';' in row['All Solutions'] and row['All Solutions'] != 'Not available')
+    multi_cves = sum(1 for row in output_data if ';' in row['All CVEs'] and row['All CVEs'] != 'No CVE')
+    multi_ips = sum(1 for row in output_data if ',' in row['Unique IPs'] and row['Unique IPs'] != 'No IPs')
+    
+    print(f"  NVT with multiple impacts: {multi_impacts}")
+    print(f"  NVT with multiple solutions: {multi_solutions}")
+    print(f"  NVT with multiple CVEs: {multi_cves}")
+    print(f"  NVT with multiple IPs: {multi_ips}")
+    
+    # Show first few results
+    print(f"\nFirst 5 results:")
+    print(f"{'='*60}")
+    for i, row in enumerate(output_data[:5], 1):
+        print(f"{i}. {row['NVT Name'][:50]}...")
+        print(f"   Impacts: {row['All Impacts'][:50]}...")
+        print(f"   IPs: {row['Unique IPs'][:50]}...")
+        print()
+
+def main():
+    """Main interactive function"""
+    print("VAPT Scan Report Summarizer")
+    print("=" * 50)
+    print("This script summarizes VAPT scan reports from CSV files.")
+    print("No external libraries required - uses only built-in Python modules.\n")
+    
+    # Get input file
+    while True:
+        input_file = input("Enter path to your CSV file: ").strip()
+        if os.path.exists(input_file):
+            break
+        print(f"File not found: {input_file}")
+        print("Please enter a valid file path.\n")
+    
+    # Generate output file name
+    base_name = os.path.splitext(input_file)[0]
+    default_output = f"{base_name}_summary.csv"
+    
+    output_file = input(f"Enter output file name [default: {default_output}]: ").strip()
+    if not output_file:
+        output_file = default_output
+    
+    # Add .csv extension if missing
+    if not output_file.lower().endswith('.csv'):
+        output_file += '.csv'
+    
+    # Check if output file exists
+    if os.path.exists(output_file):
+        overwrite = input(f"File '{output_file}' already exists. Overwrite? (y/n): ").lower()
+        if overwrite not in ['y', 'yes']:
+            print("Operation cancelled.")
+            return
+    
+    # Process the file
+    try:
+        summarize_vapt_data(input_file, output_file)
+        print(f"\n✅ Done! File saved as: {output_file}")
+    except Exception as e:
+        print(f"\n❌ Error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    # Check if run with command line arguments
+    if len(sys.argv) > 1:
+        input_file = sys.argv[1]
+        if len(sys.argv) > 2:
+            output_file = sys.argv[2]
+        else:
+            base_name = os.path.splitext(input_file)[0]
+            output_file = f"{base_name}_summary.csv"
+        
+        if os.path.exists(input_file):
+            summarize_vapt_data(input_file, output_file)
+        else:
+            print(f"Input file not found: {input_file}")
+            print("\nUsage: python script.py input.csv [output.csv]")
+    else:
+        main()
