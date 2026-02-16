@@ -1,0 +1,6 @@
+docker run -d   -p 8080:80   -p 3307:3306   -v openaudit_data:/var/lib/mysql   -v openaudit_upload:/usr/share/open-audit/upload   --name openaudit openaudit:6.0.0
+
+rm -rf /usr/share/open-audit/writable/cache/*
+service apache2 enable
+service apache2 status
+mysql -u root
